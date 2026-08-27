@@ -60,17 +60,76 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def cache_break_even_reads(
+    write_cost_per_m: float,
+    read_cost_per_m: float,
+    read_discount: float = 0.10,
+) -> float:
+    """Calculate minimum read count needed for prompt caching to break even.
+
+    Savings per read = (1 - read_discount) * read_cost_per_m
+    Break-even reads = write_cost_per_m / savings_per_read
+    """
+    savings_per_read = (1.0 - read_discount) * read_cost_per_m
+    if savings_per_read <= 0:
+        return float("inf")
+    return write_cost_per_m / savings_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    read_cost_per_m: float | None = None,
+) -> bool:
+    """Prompt caching is only financially profitable when repeated reads exceed write overhead.
+
+    Args:
+        avg_cache_reads: Average times a cached prompt prefix is read back.
+        write_cost_per_m: Cost per 1M tokens to write/create cache entry (or storage fee).
+        read_discount: Multiplier on base read price for cached tokens (default 0.10 = 90% discount).
+        read_cost_per_m: Base uncached input price per 1M tokens. If None, assumes write_cost_per_m.
+    """
+    if read_cost_per_m is None:
+        read_cost_per_m = write_cost_per_m
+    be_reads = cache_break_even_reads(write_cost_per_m, read_cost_per_m, read_discount)
+    return avg_cache_reads >= be_reads
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    interrupt_rate: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Enhanced policy (Extension 1):
+      - If interruptible & not 24/7:
+          If interruption rate is extremely high (>35%) and duty cycle >= break_even,
+          checkpoint overhead outweighs spot discounts -> 'reserved'. Otherwise -> 'spot'.
+      - If duty cycle >= break-even:
+          High duty cycle (>=55% for 45% discount) -> 'reserved'.
+      - Otherwise:
+          Spiky / low duty cycle -> 'on_demand'.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+
+    # Interruption risk profiling based on GPU type
+    gpu_risk = 0.05
+    if gpu_type in ("A10G", "L4"):
+        gpu_risk = 0.08  # commodity GPUs have slightly higher spot preemption
+    elif gpu_type in ("H100", "H200", "B200"):
+        gpu_risk = 0.04  # high-end enterprise clusters
+
+    effective_interrupt_rate = interrupt_rate if interrupt_rate is not None else gpu_risk
+
     if interruptible and hours_per_day < 24:
+        if effective_interrupt_rate > 0.35 and duty >= be:
+            return "reserved"
         return "spot"
     if duty >= be:
         return "reserved"
